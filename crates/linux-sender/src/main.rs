@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use evdev::{AbsInfo, AbsoluteAxisCode, Device, EventSummary, KeyCode};
 use std::collections::HashMap;
 use std::net::UdpSocket;
