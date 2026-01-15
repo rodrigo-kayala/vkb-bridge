@@ -1,4 +1,9 @@
-use anyhow::{bail, Result};
+use std::{
+    net::UdpSocket,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Result, bail};
 use vjoy::{ButtonState, FourWayHat, HatState, VJoy};
 
 const LISTEN_ADDR: &str = "0.0.0.0:46000";
@@ -24,30 +29,46 @@ struct Packet {
     buttons: [u8; 16],
 }
 
+#[derive(Clone, Copy, Debug)]
+enum HatMode {
+    Discrete,
+    Continuous,
+}
+
 fn main() -> Result<()> {
     let sock = UdpSocket::bind(LISTEN_ADDR)?;
     println!("Listening on UDP {LISTEN_ADDR}");
 
     let mut vjoy = VJoy::from_default_dll_location()?;
-    let device = vjoy.get_device_state_mut(VJOY_DEVICE_ID)?;
+
+    let (hats_enabled, hat_mode, num_axes, num_buttons, num_hats) = {
+        let device = vjoy.get_device_state_mut(VJOY_DEVICE_ID)?;
+
+        let hat_mode = match device.hat_type() {
+            HatState::Discrete(_) => HatMode::Discrete,
+            HatState::Continuous(_) => HatMode::Continuous,
+        };
+
+        (
+            device.num_hats() >= 1,
+            hat_mode,
+            device.num_axes(),
+            device.num_buttons(),
+            device.num_hats(),
+        )
+    };
 
     println!(
         "vJoy device {}: axes={} buttons={} hats={}",
-        VJOY_DEVICE_ID,
-        device.num_axes(),
-        device.num_buttons(),
-        device.num_hats()
+        VJOY_DEVICE_ID, num_axes, num_buttons, num_hats
     );
 
-    if device.num_buttons() < 128 {
+    if num_buttons < 128 {
         println!("Warning: vJoy device has fewer than 128 buttons enabled in vJoyConf.exe");
     }
-    if device.num_axes() < 8 {
+    if num_axes < 8 {
         println!("Warning: vJoy device has fewer than 8 axes enabled in vJoyConf.exe");
     }
-
-    let hat_mode = device.hat_type();
-    let hats_enabled = device.num_hats() >= 1;
 
     let mut buf = [0u8; 2048];
 
@@ -98,45 +119,49 @@ fn main() -> Result<()> {
             last_seq = Some(pkt.seq);
             applied += 1;
 
-            // Axes: map packet axes[0..8] to vJoy axis IDs 1..=8
-            // If your sender uses 0..=32768, passing that as i32 is fine.
-            for (i, v) in pkt.axes.iter().enumerate() {
-                let axis_id = (i as u32) + 1;
-                device.set_axis(axis_id, *v as i32)?;
-            }
+            {
+                let device = vjoy.get_device_state_mut(VJOY_DEVICE_ID)?;
 
-            // Hat: ABS_HAT0X/ABS_HAT0Y come as -1..=1.
-            // If your vJoy hat is discrete, diagonals get reduced to a cardinal direction.
-            if hats_enabled {
-                let hs = hatstate_from_xy(pkt.hat_x, pkt.hat_y, hat_mode);
-                device.set_hat(1, hs)?;
-            }
+                // Axes: map packet axes[0..8] to vJoy axis IDs 1..=8
+                // If your sender uses 0..=32768, passing that as i32 is fine.
+                for (i, v) in pkt.axes.iter().enumerate() {
+                    let axis_id = (i as u32) + 1;
+                    device.set_axis(axis_id, *v as i32)?;
+                }
 
-            // Buttons: only update changed bits (keeps it fast)
-            let delta = xor_16(pkt.buttons, last_buttons);
-            if delta != [0u8; 16] {
-                for byte_i in 0..16 {
-                    let changed = delta[byte_i];
-                    if changed == 0 {
-                        continue;
-                    }
-                    for bit in 0..8 {
-                        if (changed & (1 << bit)) == 0 {
+                // Hat: ABS_HAT0X/ABS_HAT0Y come as -1..=1.
+                // If your vJoy hat is discrete, diagonals get reduced to a cardinal direction.
+                if hats_enabled {
+                    let hs = hatstate_from_xy(pkt.hat_x, pkt.hat_y, hat_mode);
+                    device.set_hat(1, hs)?;
+                }
+
+                // Buttons: only update changed bits (keeps it fast)
+                let delta = xor_16(pkt.buttons, last_buttons);
+                if delta != [0u8; 16] {
+                    for byte_i in 0..16 {
+                        let changed = delta[byte_i];
+                        if changed == 0 {
                             continue;
                         }
-                        let btn_id_1_based = (byte_i * 8 + bit + 1) as u8;
-                        let pressed = (pkt.buttons[byte_i] & (1 << bit)) != 0;
-                        device.set_button(
-                            btn_id_1_based,
-                            if pressed {
-                                ButtonState::Pressed
-                            } else {
-                                ButtonState::Released
-                            },
-                        )?;
+                        for bit in 0..8 {
+                            if (changed & (1 << bit)) == 0 {
+                                continue;
+                            }
+                            let btn_id_1_based = (byte_i * 8 + bit + 1) as u8;
+                            let pressed = (pkt.buttons[byte_i] & (1 << bit)) != 0;
+                            device.set_button(
+                                btn_id_1_based,
+                                if pressed {
+                                    ButtonState::Pressed
+                                } else {
+                                    ButtonState::Released
+                                },
+                            )?;
+                        }
                     }
+                    last_buttons = pkt.buttons;
                 }
-                last_buttons = pkt.buttons;
             }
 
             vjoy.update_all_devices()?;
@@ -204,13 +229,13 @@ fn is_newer_u16(a: u16, b: u16) -> bool {
     diff != 0 && diff < 0x8000
 }
 
-fn hatstate_from_xy(x: i8, y: i8, hat_mode: HatState) -> HatState {
+fn hatstate_from_xy(x: i8, y: i8, hat_mode: HatMode) -> HatState {
     // Normalize to -1, 0, 1
     let x = x.clamp(-1, 1);
     let y = y.clamp(-1, 1);
 
     match hat_mode {
-        HatState::Discrete(_) => {
+        HatMode::Discrete => {
             // Discrete is 4-way + centered. Diagonals collapse.
             let v = match (x, y) {
                 (0, 0) => FourWayHat::Centered,
@@ -228,7 +253,7 @@ fn hatstate_from_xy(x: i8, y: i8, hat_mode: HatState) -> HatState {
             };
             HatState::Discrete(v)
         }
-        HatState::Continuous(_) => {
+        HatMode::Continuous => {
             // Continuous hat: 360 degrees with 1/100 degree resolution.
             // Use u32::MAX for centered (neutral).
             let angle_deg = match (x, y) {
