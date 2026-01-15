@@ -1,8 +1,7 @@
 [workspace]
-members = ["crates/linux-sender", "crates/controller-mapper", "crates/windows-receiver"]
-resolver = "2"
-
-default-members = [
+members = [
     "crates/linux-sender",
-    "crates/controller-mapper"
+    "crates/controller-mapper",
+    "crates/windows-receiver",
 ]
+resolver = "2"
