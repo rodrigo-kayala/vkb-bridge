@@ -1,16 +1,13 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use evdev::{AbsInfo, AbsoluteAxisCode, Device, EventSummary, KeyCode};
-use std::collections::HashMap;
-use std::net::UdpSocket;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
+use std::{fs, thread};
 
-const VENDOR: u16 = 0x231d;
-const PRODUCT: u16 = 0x0200;
-
-const SEND_HZ: u64 = 250;
-const DEST: &str = "192.168.0.16:46000";
+const CONFIG_FILE_PATH: &str = "config.toml";
 
 const AXIS_CODES: [AbsoluteAxisCode; 8] = [
     AbsoluteAxisCode::ABS_X,
@@ -25,6 +22,19 @@ const AXIS_CODES: [AbsoluteAxisCode; 8] = [
 
 const VJOY_AXIS_MAX: u16 = 0x8000; // 32768
 
+#[derive(Debug, Deserialize, Serialize)]
+struct Config {
+    dest: SocketAddr,
+    send_hz: u16,
+    vjoy_device: BTreeMap<u8, VJoyDevice>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct VJoyDevice {
+    vendor_id: u16,
+    product_id: u16,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct AxisRange {
     min: i32,
@@ -33,6 +43,7 @@ struct AxisRange {
 
 #[derive(Clone, Copy, Debug)]
 struct SharedState {
+    axis_range: [AxisRange; 8],
     axes_raw: [i32; 8],
     hat_x: i8,
     hat_y: i8,
@@ -43,6 +54,7 @@ struct SharedState {
 impl Default for SharedState {
     fn default() -> Self {
         Self {
+            axis_range: [AxisRange::default(); 8],
             axes_raw: [0; 8],
             hat_x: 0,
             hat_y: 0,
@@ -66,33 +78,54 @@ fn open_vkb_device(target_vendor: u16, target_product: u16) -> Result<Device> {
     )
 }
 
+fn parse() -> Result<Config> {
+    let toml_str =
+        fs::read_to_string(CONFIG_FILE_PATH).with_context(|| "Failed to read config file")?;
+    let decoded: Config =
+        toml::from_str(&toml_str).with_context(|| "Failed to parse config.toml")?;
+
+    Ok(decoded)
+}
+
 fn main() -> Result<()> {
-    let dev = open_vkb_device(VENDOR, PRODUCT)
-        .with_context(|| "Could not open VKB device. Check permissions (/dev/input/event*)")?;
+    let config = parse()?;
+    println!("Using config: {:?}", config);
+    println!("Sending UDP to {}", config.dest);
 
-    println!("Using device: {}", dev.name().unwrap_or("<no name>"));
-    println!("Sending UDP to {}", DEST);
+    let shared_map: HashMap<u8, Arc<Mutex<SharedState>>> = config
+        .vjoy_device
+        .keys()
+        .map(|k| (*k, Arc::new(Mutex::new(SharedState::default()))))
+        .collect();
 
-    // Stable key mapping: KeyCode -> button index (1..=128)
-    let button_map = build_button_map(&dev)?;
+    for (k, vjoy_device) in config.vjoy_device.iter() {
+        let dev = open_vkb_device(vjoy_device.vendor_id, vjoy_device.product_id)
+            .with_context(|| "Could not open VKB device. Check permissions (/dev/input/event*)")?;
 
-    // Axis ranges for normalization (from kernel abs info)
-    let axis_ranges = build_axis_ranges(&dev)?;
+        println!("Using device: {}", dev.name().unwrap_or("<no name>"));
 
-    let shared = Arc::new(Mutex::new(SharedState::default()));
+        // Stable key mapping: KeyCode -> button index (1..=128)
+        let button_map = build_button_map(&dev)?;
 
-    // Thread A: input reader
-    {
-        let shared = Arc::clone(&shared);
-        thread::spawn(move || {
-            if let Err(e) = input_thread(dev, shared, button_map) {
-                eprintln!("input thread error: {:#}", e);
+        // Axis ranges for normalization (from kernel abs info)
+        let axis_ranges = build_axis_ranges(&dev)?;
+
+        // Thread A: input reader
+        {
+            let shared = Arc::clone(&shared_map.get(k).unwrap());
+            {
+                shared.lock().unwrap().axis_range = axis_ranges;
             }
-        });
+            thread::spawn(move || {
+                if let Err(e) = input_thread(dev, shared, button_map) {
+                    eprintln!("input thread error: {:#}", e);
+                }
+            });
+        }
     }
 
     // Thread B: sender
-    sender_thread(shared, axis_ranges)?;
+    sender_thread(config, shared_map)?;
 
     Ok(())
 }
@@ -205,25 +238,28 @@ fn button_bitpos(btn_id_1_based: u8) -> (usize, u8) {
     (zero_based / 8, (zero_based % 8) as u8)
 }
 
-fn sender_thread(shared: Arc<Mutex<SharedState>>, axis_ranges: [AxisRange; 8]) -> Result<()> {
+fn sender_thread(config: Config, shared_map: HashMap<u8, Arc<Mutex<SharedState>>>) -> Result<()> {
     let sock = UdpSocket::bind("0.0.0.0:0")?;
-    sock.connect(DEST)?;
+    sock.connect(config.dest)?;
 
-    let period = Duration::from_nanos((1_000_000_000u64 / SEND_HZ).max(1));
+    let period = Duration::from_nanos((1_000_000_000u64 / config.send_hz as u64).max(1));
     let mut next = Instant::now();
 
-    let mut seq: u16 = 0;
-    let mut buf: [u8; 42] = [0; 42];
+    let mut seqs: HashMap<u8, u16> = shared_map.keys().map(|&k| (k, 0u16)).collect();
+    let mut buf: [u8; 43] = [0; 43];
 
     loop {
         next += period;
 
-        let snapshot = { *shared.lock().unwrap() }; // cheap copy
+        for (k, shared) in shared_map.iter() {
+            let snapshot = { *shared.lock().unwrap() }; // cheap copy
+            let seq = seqs.get_mut(k).unwrap();
 
-        encode_vkb2(&mut buf, seq, &snapshot, &axis_ranges);
-        seq = seq.wrapping_add(1);
+            encode_vkb2(&mut buf, *seq, *k, &snapshot);
+            *seq = seq.wrapping_add(1);
 
-        sock.send(&buf)?;
+            sock.send(&buf)?;
+        }
 
         let now = Instant::now();
         if next > now {
@@ -234,16 +270,18 @@ fn sender_thread(shared: Arc<Mutex<SharedState>>, axis_ranges: [AxisRange; 8]) -
     }
 }
 
-fn encode_vkb2(buf: &mut [u8; 42], seq: u16, st: &SharedState, ranges: &[AxisRange; 8]) {
-    buf[0..4].copy_from_slice(b"VKB2");
-    buf[4] = 2;
-    buf[5] = 0;
-    buf[6..8].copy_from_slice(&seq.to_le_bytes());
+fn encode_vkb2(buf: &mut [u8; 43], seq: u16, device_id: u8, st: &SharedState) {
+    // header
+    buf[0..4].copy_from_slice(b"VKB2"); // magic
+    buf[4] = 2; // version
+    buf[5] = device_id; // vjoy device id
+    buf[6] = 0; // reserved
+    buf[7..9].copy_from_slice(&seq.to_le_bytes()); // sequence
 
     // axes: u16 normalized 0..=32768
-    let mut off = 8;
+    let mut off = 9;
     for i in 0..8 {
-        let v = normalize_axis(st.axes_raw[i], ranges[i]);
+        let v = normalize_axis(st.axes_raw[i], st.axis_range[i]);
         buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
         off += 2;
     }

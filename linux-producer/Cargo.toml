@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/linux-sender", "crates/controller-mapper"]
+resolver = "2"

@@ -1,7 +1,0 @@
-[workspace]
-members = [
-    "crates/linux-sender",
-    "crates/controller-mapper",
-    "crates/windows-receiver",
-]
-resolver = "2"

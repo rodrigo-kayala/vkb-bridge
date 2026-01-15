@@ -1,0 +1,10 @@
+dest = "192.168.0.16:46000"
+send_hz = 250
+
+[vjoy_device.1] # VKBsim Gladiator EVO OT L
+vendor_id = 0x231d
+product_id = 0x3201
+
+[vjoy_device.2] # VKBsim Gladiator EVO R
+vendor_id = 0x231d
+product_id = 0x0200
